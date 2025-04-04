@@ -43,6 +43,13 @@ pub(super) fn normalize_url(url: &Url) -> Url {
     normalized
 }
 
+pub(super) fn get_origin(url: &Url) -> Option<Url> {
+    match url.host_str() {
+        Some(host_str) => Url::parse(&format!("{}://{}", url.scheme(), host_str)).ok(),
+        None => None,
+    }
+}
+
 pub(super) trait StartsWith<T> {
     fn starts_with(&self, other: &T) -> bool;
 }

@@ -26,15 +26,30 @@ enum Commands {
         /// The starting URL to begin checking from (defaults to base_url if not provided)
         #[arg(short, long = "start")]
         start_url: Option<String>,
+
+        /// Only check links that match the base URL
+        #[arg(long)]
+        internal_only: bool,
+
+        /// Use a human-like User-Agent header for requests
+        #[arg(long)]
+        human_agent: bool,
     },
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), ()> {
+    match run().await {
+        Err(_) => Err(()),
+        Ok(_) => Ok(()),
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     let env =
-        env_logger::Env::default().filter_or("RUST_LOG", if cli.trace { "trace" } else { "info" });
+        env_logger::Env::default().filter_or("RUST_LOG", if cli.trace { "trace" } else { "warn" });
     env_logger::Builder::from_env(env).init();
 
     info!("Starting docs-tools");
@@ -43,9 +58,11 @@ async fn main() -> Result<()> {
         Commands::LinkCheck {
             base_url,
             start_url,
+            internal_only,
+            human_agent,
         } => {
             let start_url = start_url.unwrap_or_else(|| base_url.clone());
-            commands::link_check::LinkChecker::new(&base_url)?
+            commands::link_check::LinkChecker::new(&base_url, internal_only, human_agent)?
                 .check(&start_url)
                 .await
         }
