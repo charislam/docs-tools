@@ -24,24 +24,30 @@ use visited::Visited;
 #[derive(Clone)]
 pub(crate) struct LinkChecker {
     /// The base URL used to determine whether a link is internal (should be
-    /// recursively checked) or external.
+    /// recursively checked) or external
     base_url: Url,
-    /// Client for the link checker library.
+    /// Client for the link checker library
     lychee_client: Arc<lychee_lib::Client>,
-    /// Client for raw HTTP requests.
+    /// Client for raw HTTP requests
     reqwest_client: reqwest::Client,
-    /// Extractor to extract HTML links from HTML documents.
+    /// Extractor to extract HTML links from HTML documents
     extractor: Extractor,
-    /// Links that have already been visited (should not repeat).
+    /// Links that have already been visited
     visited: Arc<Visited>,
-    /// Number of successfully checked links.
+    /// Number of successfully checked links
     successful_checks: Arc<AtomicUsize>,
-    /// Number of link check failures.
+    /// Number of link check failures
     failed_checks: Arc<AtomicUsize>,
-    /// Whether to only check links that are internal.
+    /// Whether to only check links that are internal
     internal_only: bool,
-    /// Progress bar for CLI display.
+    /// Progress bar for CLI display
     progress_bar: Arc<Mutex<Option<ProgressBar>>>,
+}
+
+/// A URL to check along with information about where it came from
+struct UrlWithReferrer {
+    url: Url,
+    referrer: Option<Url>,
 }
 
 enum CheckResult {
@@ -49,7 +55,7 @@ enum CheckResult {
     Failure,
 }
 
-type NextTargets = Vec<Url>;
+type NextTargets = Vec<UrlWithReferrer>;
 
 struct MaxConcurrency(usize);
 
@@ -67,6 +73,9 @@ impl std::ops::DerefMut for MaxConcurrency {
     }
 }
 
+const HUMAN_USER_AGENT: &str =  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0 Safari/537.36";
+const DEFAULT_USER_AGENT: &str = "docs-tools";
+
 impl LinkChecker {
     pub(crate) fn new(
         base_url: impl AsRef<str>,
@@ -77,9 +86,9 @@ impl LinkChecker {
         let base_url = Url::parse(base_url.as_ref())?;
 
         let user_agent = if human_agent {
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0 Safari/537.36"
+            HUMAN_USER_AGENT
         } else {
-            "docs-tools"
+            DEFAULT_USER_AGENT
         };
         let lychee_client = lychee_lib::ClientBuilder::builder()
             .user_agent(user_agent)
@@ -125,7 +134,10 @@ impl LinkChecker {
         }
 
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        queue.lock().unwrap().push_back(start_url);
+        queue.lock().unwrap().push_back(UrlWithReferrer {
+            url: start_url,
+            referrer: None,
+        });
         self.run_queue(queue, MaxConcurrency(10)).await?;
 
         {
@@ -141,15 +153,15 @@ impl LinkChecker {
 
     async fn run_queue(
         &self,
-        queue: Arc<Mutex<VecDeque<Url>>>,
+        queue: Arc<Mutex<VecDeque<UrlWithReferrer>>>,
         max_concurrent: MaxConcurrency,
     ) -> Result<()> {
         loop {
-            let batch: Vec<Url> = {
+            let batch: Vec<UrlWithReferrer> = {
                 let mut queue_lock = queue.lock().unwrap();
-                let mut batch = Vec::new();
-                while let Some(url) = queue_lock.pop_front() {
-                    batch.push(url);
+                let mut batch = Vec::with_capacity(*max_concurrent);
+                while let Some(url_with_referrer) = queue_lock.pop_front() {
+                    batch.push(url_with_referrer);
                     if batch.len() >= *max_concurrent {
                         break;
                     }
@@ -161,10 +173,14 @@ impl LinkChecker {
             }
 
             let results = stream::iter(batch)
-                .map(|url| {
+                .map(|url_with_referrer| {
                     let checker = self.clone();
                     let queue_clone = Arc::clone(&queue);
-                    async move { checker.process_url_parallel(&url, queue_clone).await }
+                    async move {
+                        checker
+                            .process_url_parallel(&url_with_referrer, queue_clone)
+                            .await
+                    }
                 })
                 .buffer_unordered(*max_concurrent)
                 .collect::<Vec<Result<()>>>()
@@ -178,9 +194,12 @@ impl LinkChecker {
 
     async fn process_url_parallel(
         &self,
-        url: &Url,
-        queue: Arc<Mutex<VecDeque<Url>>>,
+        url_with_referrer: &UrlWithReferrer,
+        queue: Arc<Mutex<VecDeque<UrlWithReferrer>>>,
     ) -> Result<()> {
+        let url = &url_with_referrer.url;
+        let referrer = &url_with_referrer.referrer;
+
         {
             let mut pb_lock = self.progress_bar.lock().unwrap();
             if let Some(pb) = pb_lock.as_mut() {
@@ -209,31 +228,55 @@ impl LinkChecker {
 
         match url.starts_with(&self.base_url) && is_html(url, None) {
             true => {
-                let result = self.check_response_internal_maybe_html(url).await?;
+                let result = self
+                    .check_response_internal_maybe_html(url, referrer.as_ref())
+                    .await?;
                 if let CheckResult::Success(Some(next)) = result {
                     let mut queue_lock = queue.lock().unwrap();
-                    for link in next {
-                        queue_lock.push_back(link);
+                    for next_url in next {
+                        queue_lock.push_back(next_url);
                     }
                 }
             }
-            false => self.check_non_internal_html(url).await,
+            false => self.check_non_internal_html(url, referrer.as_ref()).await,
         }
 
         Ok(())
     }
 
-    async fn check_response_internal_maybe_html(&self, url: &Url) -> Result<CheckResult> {
+    async fn check_response_internal_maybe_html(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+    ) -> Result<CheckResult> {
         let response = match self.reqwest_client.get(url.as_str()).send().await {
             Ok(response) => response,
             Err(e) => {
-                error!("Failed to fetch {}: {}", url.as_str(), e);
+                if let Some(ref_url) = referrer {
+                    error!(
+                        "Failed to fetch {} (referrer: {}): {}",
+                        url.as_str(),
+                        ref_url.as_str(),
+                        e
+                    );
+                } else {
+                    error!("Failed to fetch {}: {}", url.as_str(), e);
+                }
                 self.failed_checks.fetch_add(1, Ordering::Relaxed);
                 return Ok(CheckResult::Failure);
             }
         };
         if !response.status().is_success() {
-            error!("Failed to fetch {}: {}", url.as_str(), response.status());
+            if let Some(ref_url) = referrer {
+                error!(
+                    "Failed to fetch {} (referrer: {}): {}",
+                    url.as_str(),
+                    ref_url.as_str(),
+                    response.status()
+                );
+            } else {
+                error!("Failed to fetch {}: {}", url.as_str(), response.status());
+            }
             self.failed_checks.fetch_add(1, Ordering::Relaxed);
             return Ok(CheckResult::Failure);
         }
@@ -261,12 +304,13 @@ impl LinkChecker {
 
     fn extract_links(&self, curr_base: &Url, s: &str) -> NextTargets {
         let input = InputContent::from_string(s, FileType::Html);
+
         self.extractor
             .extract(&input)
             .iter()
             .filter_map(|raw_uri| {
                 let link_str = &raw_uri.text;
-                match Url::parse(link_str) {
+                let parsed_url = match Url::parse(link_str) {
                     Ok(url) => Some(url),
                     Err(ParseError::RelativeUrlWithoutBase) => {
                         if let Some(stripped) = link_str.strip_prefix('/') {
@@ -280,34 +324,56 @@ impl LinkChecker {
                         error!("Error parsing URL from raw URI: {}", link_str);
                         None
                     }
-                }
+                };
+                parsed_url.map(|url| UrlWithReferrer {
+                    url,
+                    referrer: Some(curr_base.clone()),
+                })
             })
             // Cap path depth to avoid infinite recursion from self-referring pages
-            .filter(|url| {
+            .filter(|url_with_referrer| {
                 const MAX_PATH_DEPTH: usize = 20;
-                let path_segments: Vec<_> =
-                    url.path().split('/').filter(|s| !s.is_empty()).collect();
+                let path_segments: Vec<_> = url_with_referrer
+                    .url
+                    .path()
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 if path_segments.len() > MAX_PATH_DEPTH {
-                    error!("Path exceeded depth filter: {}", url.path());
+                    error!(
+                        "Path exceeded depth filter: {}",
+                        url_with_referrer.url.path()
+                    );
                     false
                 } else {
                     true
                 }
             })
             // If internal_only is true, only include URLs that start with the base URL
-            .filter(|url| !self.internal_only || url.starts_with(&self.base_url))
+            .filter(|url_with_referrer| {
+                !self.internal_only || url_with_referrer.url.starts_with(&self.base_url)
+            })
             .collect()
     }
 
-    async fn check_non_internal_html(&self, url: &Url) {
+    async fn check_non_internal_html(&self, url: &Url, referrer: Option<&Url>) {
         match self.lychee_client.check(url.as_str()).await {
             Ok(response) => {
                 if !response.status().is_success() {
-                    error!(
-                        "Link check failed for {}: {}",
-                        url.as_str(),
-                        response.status()
-                    );
+                    if let Some(ref_url) = referrer {
+                        error!(
+                            "Link check failed for {} (referrer: {}): {}",
+                            url.as_str(),
+                            ref_url.as_str(),
+                            response.status()
+                        );
+                    } else {
+                        error!(
+                            "Link check failed for {}: {}",
+                            url.as_str(),
+                            response.status()
+                        );
+                    }
                     self.failed_checks.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.successful_checks.fetch_add(1, Ordering::Relaxed);
@@ -315,7 +381,16 @@ impl LinkChecker {
                 }
             }
             Err(e) => {
-                error!("Failed to check link {}: {}", url.as_str(), e);
+                if let Some(ref_url) = referrer {
+                    error!(
+                        "Failed to check link {} (referrer: {}): {}",
+                        url.as_str(),
+                        ref_url.as_str(),
+                        e
+                    );
+                } else {
+                    error!("Failed to check link {}: {}", url.as_str(), e);
+                }
                 self.failed_checks.fetch_add(1, Ordering::Relaxed);
             }
         }
